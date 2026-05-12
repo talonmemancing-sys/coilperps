@@ -2385,6 +2385,9 @@ footer a:hover { color: var(--paper); }
       <div class="hiw-line"><span class="hiw-dot">②</span><span>ETH collateral sent <b>with</b> open tx — no deposit step</span></div>
       <div class="hiw-line"><span class="hiw-dot">③</span><span>Filled instantly at TWAP — no orderbook</span></div>
     </div>
+    <div id="mark-warn" style="display:none; border-left:2px solid var(--short); padding:10px 14px; margin-bottom:18px; background:rgba(255,107,107,0.06); font-family:var(--mono); font-size:11px; color:var(--short); line-height:1.55;">
+      ⛔ <b>Mark price not loaded</b> — opening now would create a <b>stuck position</b> (collateral lost). Wait for stats to populate or sync TWAP.
+    </div>
 
     <div class="dir-toggle">
       <button class="dir-btn long active" data-dir="long" onclick="setDir('long')">Long</button>
@@ -2437,10 +2440,42 @@ footer a:hover { color: var(--paper); }
       Last swap > 60s ago, so getPositionView reverts.
       <button class="keeper-btn" style="margin-top:8px; display:inline-block; padding:6px 12px;" onclick="keeperSyncObs()">↻ Sync TWAP now</button>
     </div>
+
+    <!-- Emergency find-by-id panel -->
+    <details style="margin-bottom:16px; padding:10px 14px; border:1px dashed var(--line-strong); border-radius:4px; font-family:var(--mono); font-size:11.5px;">
+      <summary style="cursor:pointer; color:var(--paper-dim);">🔧 Lookup position by ID (emergency)</summary>
+      <div style="padding-top:10px;">
+        <div style="color:var(--paper-faint); margin-bottom:10px;">
+          Position list filter has bugs in v0.1. If your position isn't showing, look it up by ID manually.
+          Find your ID in the tx receipt (PositionOpened event) or guess (usually 1, 2, 3...).
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <input id="lookup-id" type="number" min="1" placeholder="position id" style="flex:1; padding:8px 10px; background:var(--bg-3); border:1px solid var(--line-strong); border-radius:3px; color:var(--paper); font-family:var(--mono); font-size:12px;">
+          <button class="keeper-btn" onclick="lookupPosition()">Lookup</button>
+          <button class="cta short" style="font-size:11px; padding:8px 12px;" onclick="lookupClose()">Force Close</button>
+        </div>
+        <div id="lookup-result" style="margin-top:10px; color:var(--paper-dim);"></div>
+      </div>
+    </details>
+
     <div class="pos-list" id="pos-list">
       <div class="pos-empty">
         no open positions
         <small>open one on the left</small>
+      </div>
+    </div>
+
+    <!-- ─── ALL OPEN POSITIONS (public) ─── -->
+    <div class="liq-section" style="border-top-style:solid; border-color: var(--line);">
+      <div class="sec-head">
+        <h3>All open <em>positions</em></h3>
+        <span class="sub" id="all-count">— total</span>
+      </div>
+      <div style="font-family:var(--mono); font-size:11px; color:var(--paper-faint); margin-bottom:14px; line-height:1.6;">
+        Public view — everyone's positions. Yours are highlighted in cyan, others in white.
+      </div>
+      <div class="pos-list" id="all-pos-list">
+        <div class="pos-empty">no positions yet<small>be the first</small></div>
       </div>
     </div>
 
@@ -2688,6 +2723,7 @@ let currentDir = 'long';
 let currentMarkPriceX18 = 0n;
 let currentMarkTick = 0;
 let myPositions = [];
+let allPositions = [];
 let pollTimer = null;
 
 // ────────────────────────────────────────────────────────────────────
@@ -2945,9 +2981,11 @@ async function refreshMyPositions() {
   if (!account || !coilRead) { myPositions = []; renderPositions(); return; }
   try {
     const nextId = await coilRead.nextPositionId();
+    console.log('[positions] nextPositionId =', nextId.toString(), 'account =', account);
     const ids = [];
     for (let i = 1n; i < nextId; i++) ids.push(i);
     if (ids.length > 200) ids.splice(0, ids.length - 200);
+    console.log('[positions] scanning ids:', ids.map(String));
 
     const results = await Promise.all(ids.map(async id => {
       // Try rich view first (needs LIQ_TWAP — may revert if oracle stale/young)
@@ -2976,12 +3014,70 @@ async function refreshMyPositions() {
         } catch (_) { return null; }
       }
     }));
-    myPositions = results
-      .filter(r => r && r.owner && r.owner.toLowerCase() === account.toLowerCase() && r.size > 0n);
+    console.log('[positions] raw results:', results.map(r => r ? {id: r.id.toString(), owner: r.owner, size: r.size?.toString(), hasLive: r.hasLiveData} : null));
+    // All open positions (public view) — anything with size > 0
+    allPositions = results.filter(r => r && r.owner && r.size > 0n);
+    // My positions — filtered by owner
+    myPositions = allPositions.filter(r => r.owner.toLowerCase() === account.toLowerCase());
     renderPositions();
+    renderAllPositions();
   } catch (e) {
     console.error('positions err', e);
   }
+}
+
+function renderAllPositions() {
+  const list = document.getElementById('all-pos-list');
+  const cnt = document.getElementById('all-count');
+  if (!list) return;
+  cnt.textContent = allPositions.length + ' total';
+  if (!allPositions.length) {
+    list.innerHTML = '<div class="pos-empty">no positions yet<small>be the first</small></div>';
+    return;
+  }
+  // Sort by ID ascending
+  const sorted = [...allPositions].sort((a, b) => Number(a.id - b.id));
+  list.innerHTML = sorted.map(p => {
+    const isMine = account && p.owner.toLowerCase() === account.toLowerCase();
+    const live = p.hasLiveData;
+    const hf = live ? Number(p.healthFactor) / 1e18 : null;
+    const hfText = !live ? '—' : (hf >= 999 ? '∞' : hf.toFixed(2));
+    const hfClass = !live ? 'healthy' : hf > 1.5 ? 'healthy' : hf > 1.0 ? 'warning' : 'danger';
+    const pnl = p.unrealizedPnl;
+    const pnlEth = live ? Number(ethers.formatEther(pnl < 0n ? -pnl : pnl)) : 0;
+    const pnlSign = pnl >= 0n ? '+' : '−';
+    const pnlClass = !live ? '' : pnl > 0n ? 'pos' : pnl < 0n ? 'neg' : '';
+    const pnlText = live ? `${pnlSign}${pnlEth.toFixed(4)} ETH` : '—';
+    const cardStyle = isMine ? 'border-color:var(--accent); background:rgba(125,249,255,0.04);' : '';
+    return `
+      <div class="pos-card" style="${cardStyle}">
+        <div class="side ${p.isLong ? 'long' : 'short'}">
+          ${p.isLong ? 'Long' : 'Short'}
+          <small>#${p.id}${isMine ? ' · YOU' : ''}</small>
+        </div>
+        <div class="stat">
+          <div class="l">Owner</div>
+          <div class="v" style="${isMine ? 'color:var(--accent)' : ''}">${p.owner.slice(0,6)}…${p.owner.slice(-4)}</div>
+        </div>
+        <div class="stat">
+          <div class="l">Size</div>
+          <div class="v">${formatCoil(p.size)}</div>
+        </div>
+        <div class="stat">
+          <div class="l">Collateral</div>
+          <div class="v">${formatEth(p.collateral)}</div>
+        </div>
+        <div class="stat">
+          <div class="l">uPnL</div>
+          <div class="v ${pnlClass}">${pnlText}</div>
+        </div>
+        <div style="display:flex; flex-direction:column; align-items:flex-end; gap:6px">
+          <div class="hf ${hfClass}">${hfText}${live ? '<small style="font-family:var(--mono); font-size:11px; color:var(--paper-faint)">×</small>' : ''}</div>
+          ${isMine ? `<button class="cta ghost" style="font-size:11px; padding:6px 10px" onclick="closePos('${p.id}')">Close</button>` : (live && hf < 1.0 ? `<button class="cta short" style="font-size:11px; padding:6px 10px" onclick="liquidatePos('${p.id}')">Liquidate</button>` : '')}
+        </div>
+      </div>
+    `;
+  }).join('');
 }
 
 function renderPositions() {
@@ -3014,6 +3110,7 @@ function renderPositions() {
         <div class="side ${p.isLong ? 'long' : 'short'}">
           ${p.isLong ? 'Long' : 'Short'}
           <small>#${p.id}${!live ? ' · stale' : ''}</small>
+          ${account && p.owner.toLowerCase() !== account.toLowerCase() ? '<small style="color:var(--short); display:block; font-size:9px;">' + p.owner.slice(0,6) + '…' + p.owner.slice(-4) + '</small>' : ''}
         </div>
         <div class="stat">
           <div class="l">Size</div>
@@ -3056,7 +3153,20 @@ function recalc() {
   document.getElementById('lev-num').textContent = lev.toFixed(1);
   document.getElementById('lev-info').textContent = lev.toFixed(1) + '×';
 
-  if (!collateralIn || !currentMarkPriceX18) {
+  // Show/hide mark-not-loaded warning
+  const markWarn = document.getElementById('mark-warn');
+  if (markWarn) {
+    const markLoaded = currentMarkPriceX18 && currentMarkPriceX18 !== 0n;
+    markWarn.style.display = markLoaded ? 'none' : 'block';
+    // Also disable open button when not loaded
+    const btn = document.getElementById('openBtn');
+    if (btn && account && !markLoaded) {
+      btn.disabled = true;
+      btn.textContent = 'Mark price not loaded — wait';
+    }
+  }
+
+  if (!collateralIn || !currentMarkPriceX18 || currentMarkPriceX18 === 0n) {
     document.getElementById('pv-notional').textContent = '— ETH';
     document.getElementById('pv-size').textContent = '— COIL';
     document.getElementById('pv-entry').textContent = '— COIL/ETH';
@@ -3064,9 +3174,8 @@ function recalc() {
     return;
   }
   const notionalEth = collateralIn * lev;
-  // size_coil = notional_eth × price_coil_per_eth
-  // price_coil_per_eth scaled 1e18 in BigInt; convert to number for UI
-  const priceFloat = Number(currentMarkPriceX18) / 1e18;
+  // priceX18 is BigInt. Use ethers.formatUnits for safe float conversion (handles huge prices).
+  const priceFloat = Number(ethers.formatUnits(currentMarkPriceX18, 18));
   const sizeCoil = notionalEth * priceFloat;
 
   document.getElementById('pv-notional').textContent = notionalEth.toFixed(4) + ' ETH';
@@ -3088,13 +3197,25 @@ async function openPosition() {
   if (!collateralIn || collateralIn < 0.01) return toast('Collateral must be ≥ 0.01 ETH', 'error');
   if (lev > 10) return toast('Max leverage is 10×', 'error');
 
+  // CRITICAL pre-flight: mark price must be live BEFORE submitting
+  // (Otherwise a stale/zero priceX18 → sizeWei=0 → STUCK POSITION on-chain!)
+  if (!currentMarkPriceX18 || currentMarkPriceX18 === 0n) {
+    return toast('⛔ Mark price not loaded — refresh page (Ctrl+Shift+R) and wait for stats to populate.', 'error');
+  }
+  if (!currentMarkTick) {
+    return toast('⛔ Mark tick = 0 — pool not ready or oracle stale. Sync TWAP first.', 'error');
+  }
+
   // Compute size: size_coil = collateral × lev × price (COIL/ETH × 1e18)
-  // sizeWei = collateralWei × lev × priceX18 / 1e18
   const collateralWei = ethers.parseEther(collateralIn.toString());
-  const levBigInt = BigInt(Math.floor(lev * 1000));  // ×1000 for precision
+  const levBigInt = BigInt(Math.floor(lev * 1000));
   const sizeWei = (collateralWei * levBigInt * currentMarkPriceX18) / (1000n * (10n ** 18n));
 
-  if (sizeWei > ((2n ** 128n) - 1n)) return toast('Size overflow', 'error');
+  // CRITICAL guard: never submit size=0 (contract creates an unrecoverable stuck position!)
+  if (sizeWei === 0n) {
+    return toast('⛔ Computed size = 0 — would create a stuck position. Refresh page.', 'error');
+  }
+  if (sizeWei > ((2n ** 128n) - 1n)) return toast('Size overflow — reduce collateral or leverage', 'error');
 
   try {
     document.getElementById('openBtn').disabled = true;
@@ -3121,13 +3242,34 @@ async function openPosition() {
 async function closePos(id) {
   if (!signer || !coilWrite) return toast('Connect wallet first', 'error');
   try {
+    // Pre-flight: try a static call to see if it would revert
+    try {
+      await coilWrite.closePosition.staticCall(id);
+    } catch (simErr) {
+      const msg = (simErr.shortMessage || simErr.message || '').toLowerCase();
+      // If revert is due to stale oracle, auto-sync first
+      if (msg.includes('stale') || msg.includes('insufficienthistory') || msg.includes('0x')) {
+        toast('Oracle stale — auto-syncing first...', 'info');
+        try {
+          const syncTx = await coilWrite.syncObservation();
+          await syncTx.wait();
+          toast('TWAP synced, now closing...', 'info');
+        } catch (syncErr) {
+          toast('Sync failed: ' + (syncErr.shortMessage || syncErr.message), 'error');
+          return;
+        }
+      } else {
+        throw simErr;  // re-throw if it's not staleness
+      }
+    }
+
     const tx = await coilWrite.closePosition(id);
     toast('Closing #' + id + ': <a class="tx-link" target="_blank" href="' + CONFIG.EXPLORER + '/tx/' + tx.hash + '">' + tx.hash.slice(0,10) + '…</a>', 'info');
     const rc = await tx.wait();
-    toast('Position #' + id + ' closed', 'success');
+    toast('Position #' + id + ' closed in block ' + rc.blockNumber, 'success');
     refreshAll();
   } catch (e) {
-    toast('Close failed: ' + (e.shortMessage || e.message || e), 'error');
+    toast('Close failed: ' + (e.shortMessage || e.message || String(e)).slice(0, 120), 'error');
   }
 }
 
@@ -3177,24 +3319,15 @@ async function setMaxCollateral() {
 let liquidatable = [];
 
 async function refreshLiquidatable() {
-  if (!coilRead) return;
-  try {
-    const nextId = await coilRead.nextPositionId();
-    const ids = [];
-    for (let i = 1n; i < nextId; i++) ids.push(i);
-    if (ids.length > 200) ids.splice(0, ids.length - 200);
-    const results = await Promise.all(ids.map(id =>
-      coilRead.getPositionView(id).then(r => ({ id, ...r })).catch(() => null)
-    ));
-    liquidatable = results
-      .filter(r => r && r.size > 0n)
-      .filter(r => r.healthFactor < (10n ** 18n))
-      .sort((a, b) => {
-        const diff = a.healthFactor - b.healthFactor;
-        return diff < 0n ? -1 : diff > 0n ? 1 : 0;
-      });
-    renderLiquidatable();
-  } catch (e) { console.error('liquidatable err', e); }
+  // Now derived from allPositions (already loaded by refreshMyPositions)
+  // Only positions with live data and HF < 1.0 are liquidatable
+  liquidatable = allPositions
+    .filter(r => r.hasLiveData && r.healthFactor < (10n ** 18n))
+    .sort((a, b) => {
+      const diff = a.healthFactor - b.healthFactor;
+      return diff < 0n ? -1 : diff > 0n ? 1 : 0;
+    });
+  renderLiquidatable();
 }
 
 function renderLiquidatable() {
@@ -3239,13 +3372,25 @@ function renderLiquidatable() {
 async function liquidatePos(id) {
   if (!signer || !coilWrite) return toast('Connect wallet first', 'error');
   try {
+    try {
+      await coilWrite.liquidate.staticCall(id);
+    } catch (simErr) {
+      const msg = (simErr.shortMessage || simErr.message || '').toLowerCase();
+      if (msg.includes('stale') || msg.includes('insufficienthistory')) {
+        toast('Oracle stale — auto-syncing first...', 'info');
+        const syncTx = await coilWrite.syncObservation();
+        await syncTx.wait();
+      } else {
+        throw simErr;
+      }
+    }
     const tx = await coilWrite.liquidate(id);
     toast('Liquidating #' + id + ': <a class="tx-link" target="_blank" href="' + CONFIG.EXPLORER + '/tx/' + tx.hash + '">' + tx.hash.slice(0,10) + '…</a>', 'info');
-    const rc = await tx.wait();
+    await tx.wait();
     toast('🎯 Liquidated #' + id + ' — bounty earned', 'success');
     refreshAll();
   } catch (e) {
-    toast('Liquidate failed: ' + (e.shortMessage || e.message || String(e)), 'error');
+    toast('Liquidate failed: ' + (e.shortMessage || e.message || String(e)).slice(0, 120), 'error');
   }
 }
 
@@ -3286,24 +3431,123 @@ async function keeperSyncObs() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Math / formatters
+// Emergency lookup
 // ────────────────────────────────────────────────────────────────────
-function priceFromTick(tick) {
-  // V4 sqrtPriceX96 = 1.0001^(tick/2) × 2^96
-  // price = (sqrtP^2) / 2^96 × 1e18
-  // For JS BigInt: approximate via Math.pow then convert
-  const sqrt = Math.pow(1.0001, tick / 2);
-  const price = sqrt * sqrt;  // = 1.0001^tick
-  // scale to 1e18 BigInt
-  const scaled = Math.floor(price * 1e18);
-  if (!isFinite(scaled) || scaled <= 0) return 0n;
-  return BigInt(scaled);
+async function lookupPosition() {
+  const id = document.getElementById('lookup-id').value;
+  if (!id || !coilRead) return;
+  const result = document.getElementById('lookup-result');
+  result.innerHTML = 'Looking up #' + id + '...';
+  try {
+    // Try raw struct first (no oracle)
+    const p = await coilRead.getPosition(id);
+    if (!p.owner || p.owner === '0x0000000000000000000000000000000000000000') {
+      result.innerHTML = '<span style="color:var(--short)">#' + id + ' does not exist or was closed</span>';
+      return;
+    }
+    let html = '<div style="line-height:1.7;">';
+    html += '<b style="color:var(--paper)">Position #' + id + '</b><br>';
+    html += '<span style="color:var(--paper-faint)">owner:</span> ' + p.owner;
+    if (account && p.owner.toLowerCase() === account.toLowerCase()) html += ' <span style="color:var(--long)">(YOU)</span>';
+    html += '<br>';
+    html += '<span style="color:var(--paper-faint)">side:</span> ' + (p.isLong ? '<span style="color:var(--long)">Long</span>' : '<span style="color:var(--short)">Short</span>') + '<br>';
+    html += '<span style="color:var(--paper-faint)">size:</span> ' + formatCoil(p.size) + '<br>';
+    html += '<span style="color:var(--paper-faint)">collateral:</span> ' + formatEth(p.collateral) + '<br>';
+    html += '<span style="color:var(--paper-faint)">entry tick:</span> ' + p.entryTick + '<br>';
+    html += '<span style="color:var(--paper-faint)">open block:</span> ' + p.openBlock + '<br>';
+
+    // Try rich view
+    try {
+      const v = await coilRead.getPositionView(id);
+      const hf = Number(v.healthFactor) / 1e18;
+      const pnl = Number(ethers.formatEther(v.unrealizedPnl < 0n ? -v.unrealizedPnl : v.unrealizedPnl));
+      html += '<span style="color:var(--paper-faint)">unrealized PnL:</span> ' + (v.unrealizedPnl >= 0n ? '+' : '−') + pnl.toFixed(4) + ' ETH<br>';
+      html += '<span style="color:var(--paper-faint)">health factor:</span> ' + (hf >= 999 ? '∞' : hf.toFixed(3)) + '<br>';
+    } catch (e) {
+      html += '<span style="color:var(--warn)">oracle stale — PnL/health unavailable. Click "↻ Sync TWAP" first.</span><br>';
+    }
+    html += '</div>';
+    result.innerHTML = html;
+  } catch (e) {
+    result.innerHTML = '<span style="color:var(--short)">Error: ' + (e.shortMessage || e.message || e) + '</span>';
+  }
 }
 
+async function lookupClose() {
+  const id = document.getElementById('lookup-id').value;
+  if (!id) return toast('Enter a position ID first', 'error');
+  if (!confirm('Force close position #' + id + '? (will auto-sync oracle if needed)')) return;
+  await closePos(id);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Math / formatters
+// ────────────────────────────────────────────────────────────────────
+// ━━━ Uniswap TickMath ported to BigInt (full precision, no Number overflow) ━━━
+const MAX_TICK_ = 887272n;
+const Q96_BI    = 1n << 96n;
+const Q32_BI    = 1n << 32n;
+
+function getSqrtPriceAtTickBigInt(tick) {
+  const tickBI = BigInt(tick);
+  const absTick = tickBI < 0n ? -tickBI : tickBI;
+  if (absTick > MAX_TICK_) throw new Error('Tick out of range: ' + tick);
+
+  let r = (absTick & 0x1n) !== 0n
+    ? 0xfffcb933bd6fad37aa2d162d1a594001n
+    : 0x100000000000000000000000000000000n;
+
+  if ((absTick & 0x2n)     !== 0n) r = (r * 0xfff97272373d413259a46990580e213an) >> 128n;
+  if ((absTick & 0x4n)     !== 0n) r = (r * 0xfff2e50f5f656932ef12357cf3c7fdccn) >> 128n;
+  if ((absTick & 0x8n)     !== 0n) r = (r * 0xffe5caca7e10e4e61c3624eaa0941cd0n) >> 128n;
+  if ((absTick & 0x10n)    !== 0n) r = (r * 0xffcb9843d60f6159c9db58835c926644n) >> 128n;
+  if ((absTick & 0x20n)    !== 0n) r = (r * 0xff973b41fa98c081472e6896dfb254c0n) >> 128n;
+  if ((absTick & 0x40n)    !== 0n) r = (r * 0xff2ea16466c96a3843ec78b326b52861n) >> 128n;
+  if ((absTick & 0x80n)    !== 0n) r = (r * 0xfe5dee046a99a2a811c461f1969c3053n) >> 128n;
+  if ((absTick & 0x100n)   !== 0n) r = (r * 0xfcbe86c7900a88aedcffc83b479aa3a4n) >> 128n;
+  if ((absTick & 0x200n)   !== 0n) r = (r * 0xf987a7253ac413176f2b074cf7815e54n) >> 128n;
+  if ((absTick & 0x400n)   !== 0n) r = (r * 0xf3392b0822b70005940c7a398e4b70f3n) >> 128n;
+  if ((absTick & 0x800n)   !== 0n) r = (r * 0xe7159475a2c29b7443b29c7fa6e889d9n) >> 128n;
+  if ((absTick & 0x1000n)  !== 0n) r = (r * 0xd097f3bdfd2022b8845ad8f792aa5825n) >> 128n;
+  if ((absTick & 0x2000n)  !== 0n) r = (r * 0xa9f746462d870fdf8a65dc1f90e061e5n) >> 128n;
+  if ((absTick & 0x4000n)  !== 0n) r = (r * 0x70d869a156d2a1b890bb3df62baf32f7n) >> 128n;
+  if ((absTick & 0x8000n)  !== 0n) r = (r * 0x31be135f97d08fd981231505542fcfa6n) >> 128n;
+  if ((absTick & 0x10000n) !== 0n) r = (r * 0x9aa508b5b7a84e1c677de54f3e99bc9n)  >> 128n;
+  if ((absTick & 0x20000n) !== 0n) r = (r * 0x5d6af8dedb81196699c329225ee604n)   >> 128n;
+  if ((absTick & 0x40000n) !== 0n) r = (r * 0x2216e584f5fa1ea926041bedfe98n)     >> 128n;
+  if ((absTick & 0x80000n) !== 0n) r = (r * 0x48a170391f7dc42444e8fa2n)          >> 128n;
+
+  if (tickBI > 0n) {
+    const MAX_UINT256 = (1n << 256n) - 1n;
+    r = MAX_UINT256 / r;
+  }
+
+  // Convert Q128.128 → Q96 (sqrtPriceX96)
+  return (r >> 32n) + (r % Q32_BI === 0n ? 0n : 1n);
+}
+
+// Mirror of contract's PositionMath.priceFromTick — returns priceX18 (COIL per ETH × 1e18)
+function priceFromTick(tick) {
+  try {
+    const sqrtP = getSqrtPriceAtTickBigInt(tick);
+    // priceX96 = sqrtP^2 / Q96
+    const priceX96 = (sqrtP * sqrtP) / Q96_BI;
+    // priceX18 = priceX96 * 1e18 / Q96
+    const priceX18 = (priceX96 * (10n ** 18n)) / Q96_BI;
+    return priceX18;
+  } catch (e) {
+    console.warn('priceFromTick err:', e);
+    return 0n;
+  }
+}
+
+// Display helper — uses BigInt internally, converts safely for display
 function formatPriceFromTick(tick) {
-  const sqrt = Math.pow(1.0001, tick / 2);
-  const price = sqrt * sqrt;
-  return formatCoilNum(price);
+  const priceX18 = priceFromTick(tick);
+  if (priceX18 === 0n) return '—';
+  // Use ethers.formatUnits to get full-precision decimal string
+  const priceFloat = Number(ethers.formatUnits(priceX18, 18));
+  return formatCoilNum(priceFloat);
 }
 
 function formatEth(weiBigInt) {
